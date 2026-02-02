@@ -68,7 +68,13 @@ public class ParkingUpdateScheduler {
         int lastPageNumber = calculateLastPageNumber(totalSize, readSize);
 
         return Stream.iterate(1, i -> i <= lastPageNumber, i -> i + 1)
-                .map(i -> CompletableFuture.supplyAsync(() -> parkingApi.read(i, readSize), executorService))
+                .map(i -> CompletableFuture
+                        .supplyAsync(() -> parkingApi.read(i, readSize), executorService)
+                        .exceptionally(throwable -> {
+                            log.error("페이지 {} 데이터 fetch 실패. API={}, error={}",
+                                    i, parkingApi.getClass().getSimpleName(), throwable.getMessage());
+                            return List.of();  // 실패한 페이지는 빈 리스트 반환
+                        }))
                 .toList();
     }
 
