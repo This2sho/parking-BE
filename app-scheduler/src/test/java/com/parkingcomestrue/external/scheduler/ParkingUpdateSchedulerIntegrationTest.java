@@ -22,13 +22,12 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
 /**
  * ParkingUpdateScheduler.readBy() 메서드의 4가지 시나리오 테스트
@@ -41,17 +40,18 @@ class ParkingUpdateSchedulerIntegrationTest {
 
     private FakeParkingBatchRepository parkingRepository;
     private FakeCoordinateApiService coordinateService;
-    private ExecutorService executorService;
-
+    private ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+    
     @BeforeEach
     void setUp() {
         parkingRepository = new FakeParkingBatchRepository();
         coordinateService = new FakeCoordinateApiService();
-        executorService = Executors.newFixedThreadPool(10, r -> {
-            Thread thread = new Thread(r);
-            thread.setDaemon(true);
-            return thread;
-        });
+        executor.setCorePoolSize(20);
+        executor.setMaxPoolSize(100);
+        executor.setQueueCapacity(0);
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(60 * 5);
+        executor.initialize();
     }
 
     @Nested
@@ -68,7 +68,7 @@ class ParkingUpdateSchedulerIntegrationTest {
                     List.of(successService, failService),
                     coordinateService,
                     parkingRepository,
-                    executorService
+                    executor
             );
 
             // when
@@ -90,7 +90,7 @@ class ParkingUpdateSchedulerIntegrationTest {
                     List.of(successService),
                     coordinateService,
                     parkingRepository,
-                    executorService
+                    executor
             );
 
             // when
@@ -113,7 +113,7 @@ class ParkingUpdateSchedulerIntegrationTest {
                     List.of(service),
                     coordinateService,
                     parkingRepository,
-                    executorService
+                    executor
             );
 
             // when
@@ -135,7 +135,7 @@ class ParkingUpdateSchedulerIntegrationTest {
                     List.of(failService),
                     coordinateService,
                     parkingRepository,
-                    executorService
+                    executor
             );
 
             // when & then: 예외 없이 정상 종료되어야 함
@@ -161,7 +161,7 @@ class ParkingUpdateSchedulerIntegrationTest {
                     List.of(unhealthyService),
                     coordinateService,
                     parkingRepository,
-                    executorService
+                    executor
             );
 
             // when
@@ -182,7 +182,7 @@ class ParkingUpdateSchedulerIntegrationTest {
                     List.of(healthyService, unhealthyService),
                     coordinateService,
                     parkingRepository,
-                    executorService
+                    executor
             );
 
             // when

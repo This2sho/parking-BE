@@ -12,7 +12,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -22,6 +21,7 @@ import java.util.stream.Stream;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.stereotype.Component;
 
 @Slf4j
@@ -32,7 +32,7 @@ public class ParkingUpdateScheduler {
     private final List<ParkingApiService> parkingApiServices;
     private final CoordinateApiService coordinateApiService;
     private final ParkingBatchRepository parkingBatchRepository;
-    private final ExecutorService executorService;
+    private final ThreadPoolTaskExecutor apiTaskExecutor;
 
     @Scheduled(cron = "0 */30 * * * *")
     public void autoUpdateOfferCurrentParking() {
@@ -69,7 +69,7 @@ public class ParkingUpdateScheduler {
 
         return Stream.iterate(1, i -> i <= lastPageNumber, i -> i + 1)
                 .map(i -> CompletableFuture
-                        .supplyAsync(() -> parkingApi.read(i, readSize), executorService)
+                        .supplyAsync(() -> parkingApi.read(i, readSize), apiTaskExecutor)
                         .exceptionally(throwable -> {
                             log.error("페이지 {} 데이터 fetch 실패. API={}, error={}",
                                     i, parkingApi.getClass().getSimpleName(), throwable.getMessage());

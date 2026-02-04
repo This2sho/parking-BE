@@ -1,19 +1,21 @@
 package com.parkingcomestrue.external.api;
 
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
 @Configuration
 public class AsyncApiExecutorConfig {
 
     @Bean
-    public ExecutorService executorService() {
-        return Executors.newFixedThreadPool(100, (Runnable r) -> {
-            Thread thread = new Thread(r);
-            thread.setDaemon(true);
-            return thread;
-        });
+    public ThreadPoolTaskExecutor apiTaskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(20);
+        executor.setMaxPoolSize(100);
+        executor.setQueueCapacity(0);
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(60 * 5);
+        executor.initialize();
+        return executor;
     }
 }

@@ -1,11 +1,6 @@
 spring:
   profiles:
     active: ${PROFILE:dev}
-  lifecycle:
-    timeout-per-shutdown-phase: 5m
-
-server:
-  shutdown: graceful
 
 # API KEY
 kakao:
