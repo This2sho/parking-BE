@@ -6,8 +6,8 @@ import com.parkingcomestrue.external.api.coordinate.CoordinateApiService;
 import com.parkingcomestrue.external.api.HealthCheckResponse;
 import com.parkingcomestrue.external.api.parkingapi.ParkingApiService;
 import com.parkingcomestrue.external.respository.ParkingBatchRepository;
+import java.util.ArrayList;
 import java.util.Collection;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -29,6 +29,8 @@ import org.springframework.stereotype.Component;
 @Component
 public class ParkingUpdateScheduler {
 
+    private static final int BATCH_SIZE = 2000;
+
     private final List<ParkingApiService> parkingApiServices;
     private final CoordinateApiService coordinateApiService;
     private final ParkingBatchRepository parkingBatchRepository;
@@ -36,45 +38,91 @@ public class ParkingUpdateScheduler {
 
     @Scheduled(cron = "0 */30 * * * *")
     public void autoUpdateOfferCurrentParking() {
-        Map<String, Parking> parkingLots = readBy(ParkingApiService::offerCurrentParking);
-        Map<String, Parking> saved = findAllByName(parkingLots.keySet());
-        updateSavedParkingLots(parkingLots, saved);
-        saveNewParkingLots(parkingLots, saved);
+        List<List<Parking>> failedChunks = new ArrayList<>();
+        processApis(ParkingApiService::offerCurrentParking, failedChunks);
+        retryFailedChunks(failedChunks);
     }
 
-    private Map<String, Parking> readBy(Predicate<ParkingApiService> currentParkingAvailable) {
-        List<ParkingApiService> parkingApis = filterBy(currentParkingAvailable);
-        Map<String, Parking> result = new HashMap<>();
-        for (ParkingApiService parkingApi : parkingApis) {
-            HealthCheckResponse healthCheckResponse = parkingApi.check();
-            if (healthCheckResponse.isHealthy()) {
-                List<CompletableFuture<List<Parking>>> responses = fetchParkingDataAsync(
-                        parkingApi, healthCheckResponse.getTotalSize());
-                Map<String, Parking> response = collectParkingData(responses);
-                result.putAll(response);
+    @Scheduled(fixedRate = 30, timeUnit = TimeUnit.DAYS)
+    public void autoUpdateNotOfferCurrentParking() {
+        List<List<Parking>> failedChunks = new ArrayList<>();
+        processApis(api -> !api.offerCurrentParking(), failedChunks);
+        retryFailedChunks(failedChunks);
+    }
+
+    private void processApis(Predicate<ParkingApiService> filter, List<List<Parking>> failedChunks) {
+        for (ParkingApiService parkingApi : filterBy(filter)) {
+            HealthCheckResponse health = parkingApi.check();
+            if (health.isHealthy()) {
+                processApiInChunks(parkingApi, health.getTotalSize(), failedChunks);
             }
         }
-        return result;
     }
 
-    private List<ParkingApiService> filterBy(Predicate<ParkingApiService> currentParkingAvailable) {
-        return parkingApiServices.stream()
-                .filter(currentParkingAvailable)
+    private void processApiInChunks(ParkingApiService parkingApi, int totalSize, List<List<Parking>> failedChunks) {
+        int readSize = parkingApi.getReadSize();
+        int pagesPerChunk = Math.max(1, BATCH_SIZE / readSize);
+        int lastPage = calculateLastPageNumber(totalSize, readSize);
+
+        for (int startPage = 1; startPage <= lastPage; startPage += pagesPerChunk) {
+            int endPage = Math.min(startPage + pagesPerChunk - 1, lastPage);
+            List<Parking> chunk = fetchChunk(parkingApi, startPage, endPage, readSize);
+            persistChunk(chunk, parkingApi, startPage, failedChunks);
+        }
+    }
+
+    private List<Parking> fetchChunk(ParkingApiService parkingApi, int startPage, int endPage, int readSize) {
+        List<CompletableFuture<List<Parking>>> futures =
+                Stream.iterate(startPage, i -> i <= endPage, i -> i + 1)
+                        .map(i -> CompletableFuture
+                                .supplyAsync(() -> parkingApi.read(i, readSize), apiTaskExecutor)
+                                .exceptionally(throwable -> {
+                                    log.error("페이지 {} fetch 실패. API={}, error={}",
+                                            i, parkingApi.getClass().getSimpleName(), throwable.getMessage());
+                                    return List.of();
+                                }))
+                        .toList();
+
+        return futures.stream()
+                .map(CompletableFuture::join)
+                .flatMap(Collection::stream)
                 .toList();
     }
 
-    private List<CompletableFuture<List<Parking>>> fetchParkingDataAsync(ParkingApiService parkingApi, int totalSize) {
-        int readSize = parkingApi.getReadSize();
-        int lastPageNumber = calculateLastPageNumber(totalSize, readSize);
+    private void persistChunk(List<Parking> chunk, ParkingApiService api, int startPage,
+                               List<List<Parking>> failedChunks) {
+        try {
+            Map<String, Parking> chunkMap = chunk.stream().collect(toParkingMap());
+            Map<String, Parking> saved = findAllByName(chunkMap.keySet());
+            updateSavedParkingLots(chunkMap, saved);
+            saveNewParkingLots(chunkMap, saved);
+        } catch (Exception e) {
+            log.error("청크 저장 실패. API={}, startPage={}, size={}",
+                    api.getClass().getSimpleName(), startPage, chunk.size(), e);
+            failedChunks.add(chunk);
+        }
+    }
 
-        return Stream.iterate(1, i -> i <= lastPageNumber, i -> i + 1)
-                .map(i -> CompletableFuture
-                        .supplyAsync(() -> parkingApi.read(i, readSize), apiTaskExecutor)
-                        .exceptionally(throwable -> {
-                            log.error("페이지 {} 데이터 fetch 실패. API={}, error={}",
-                                    i, parkingApi.getClass().getSimpleName(), throwable.getMessage());
-                            return List.of();  // 실패한 페이지는 빈 리스트 반환
-                        }))
+    private void retryFailedChunks(List<List<Parking>> failedChunks) {
+        if (failedChunks.isEmpty()) {
+            return;
+        }
+        log.info("실패한 청크 재시도. count={}", failedChunks.size());
+        for (List<Parking> chunk : failedChunks) {
+            try {
+                Map<String, Parking> chunkMap = chunk.stream().collect(toParkingMap());
+                Map<String, Parking> saved = findAllByName(chunkMap.keySet());
+                updateSavedParkingLots(chunkMap, saved);
+                saveNewParkingLots(chunkMap, saved);
+            } catch (Exception e) {
+                log.error("청크 재시도 실패. size={}", chunk.size(), e);
+            }
+        }
+    }
+
+    private List<ParkingApiService> filterBy(Predicate<ParkingApiService> filter) {
+        return parkingApiServices.stream()
+                .filter(filter)
                 .toList();
     }
 
@@ -84,16 +132,6 @@ public class ParkingUpdateScheduler {
             return lastPageNumber;
         }
         return lastPageNumber + 1;
-    }
-
-    private Map<String, Parking> collectParkingData(List<CompletableFuture<List<Parking>>> responses) {
-        List<List<Parking>> parkingLots = responses.stream()
-                .map(CompletableFuture::join)
-                .toList();
-
-        return parkingLots.stream()
-                .flatMap(Collection::stream)
-                .collect(toParkingMap());
     }
 
     private Collector<Parking, ?, Map<String, Parking>> toParkingMap() {
@@ -111,9 +149,9 @@ public class ParkingUpdateScheduler {
     }
 
     private void updateSavedParkingLots(Map<String, Parking> parkingLots, Map<String, Parking> saved) {
-        for (String parkingName : saved.keySet()) {
-            Parking origin = saved.get(parkingName);
-            Parking updated = parkingLots.get(parkingName);
+        for (Map.Entry<String, Parking> entry : saved.entrySet()) {
+            Parking origin = entry.getValue();
+            Parking updated = parkingLots.get(entry.getKey());
             origin.update(updated);
         }
     }
@@ -138,13 +176,5 @@ public class ParkingUpdateScheduler {
                     parking.getLocation());
             parking.update(locationByAddress);
         }
-    }
-
-    @Scheduled(fixedRate = 30, timeUnit = TimeUnit.DAYS)
-    public void autoUpdateNotOfferCurrentParking() {
-        Map<String, Parking> parkingLots = readBy(parkingApiService -> !parkingApiService.offerCurrentParking());
-        Map<String, Parking> saved = findAllByName(parkingLots.keySet());
-        updateSavedParkingLots(parkingLots, saved);
-        saveNewParkingLots(parkingLots, saved);
     }
 }

@@ -6,9 +6,11 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.locationtech.jts.geom.Point;
 import org.springframework.stereotype.Repository;
 
+@Slf4j
 @RequiredArgsConstructor
 @Repository
 public class ParkingBatchRepositoryImpl implements ParkingBatchRepository {
@@ -22,8 +24,7 @@ public class ParkingBatchRepositoryImpl implements ParkingBatchRepository {
     public void saveWithBatch(List<Parking> parkingLots) {
         for (int i = 0; i < parkingLots.size(); i += BATCH_SIZE) {
             int end = Math.min(i + BATCH_SIZE, parkingLots.size());
-            List<Parking> subParkingLots = parkingLots.subList(i, end);
-            parkingBulkRepository.saveAllWithBulk(subParkingLots);
+            parkingBulkRepository.saveAllWithBulk(parkingLots.subList(i, end));
         }
     }
 

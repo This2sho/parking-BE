@@ -7,6 +7,9 @@ import java.util.List;
 import lombok.RequiredArgsConstructor;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.ParameterizedPreparedStatementSetter;
+import org.springframework.dao.DataAccessException;
+import org.springframework.retry.annotation.Backoff;
+import org.springframework.retry.annotation.Retryable;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -51,6 +54,11 @@ public class ParkingBulkRepository {
 
     private final JdbcTemplate jdbcTemplate;
 
+    @Retryable(
+            retryFor = DataAccessException.class,
+            maxAttempts = 3,
+            backoff = @Backoff(delay = 1000, multiplier = 2)
+    )
     @Transactional
     public void saveAllWithBulk(List<Parking> parkingLots) {
         String sql = "INSERT INTO parking "
