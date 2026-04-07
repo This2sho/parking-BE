@@ -23,6 +23,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.IntStream;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -30,22 +32,24 @@ import org.junit.jupiter.api.Test;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
 /**
- * ParkingUpdateScheduler.readBy() 메서드의 4가지 시나리오 테스트
- * - 시나리오 1: 모든 요청 실패
- * - 시나리오 2: 모든 요청 성공
- * - 시나리오 3: 초반 실패 → 후반 성공
- * - 시나리오 4: 초반 성공 → 후반 실패
+ * ParkingUpdateScheduler의 주요 통합 시나리오 테스트
+ * - 모든 요청 성공
+ * - 모든 요청 실패
+ * - 초반 실패 → 후반 성공
+ * - 초반 성공 → 후반 실패
+ * - 여러 API 중 일부만 성공
  */
 class ParkingUpdateSchedulerIntegrationTest {
 
     private FakeParkingBatchRepository parkingRepository;
     private FakeCoordinateApiService coordinateService;
-    private ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+    private ThreadPoolTaskExecutor executor;
     
     @BeforeEach
     void setUp() {
         parkingRepository = new FakeParkingBatchRepository();
         coordinateService = new FakeCoordinateApiService();
+        executor = new ThreadPoolTaskExecutor();
         executor.setCorePoolSize(20);
         executor.setMaxPoolSize(100);
         executor.setQueueCapacity(0);
@@ -54,18 +58,24 @@ class ParkingUpdateSchedulerIntegrationTest {
         executor.initialize();
     }
 
+    @AfterEach
+    void tearDown() {
+        if (executor != null) {
+            executor.shutdown();
+        }
+    }
+
     @Nested
     @DisplayName("readBy() 시나리오 테스트")
     class ReadByScenarioTest {
 
         @Test
-        @DisplayName("시나리오 1: 여러 API 중 일부만 성공해도 성공한 API의 데이터는 저장된다")
-        void mixedApiSuccess() {
-            // given: 하나는 성공, 하나는 실패
-            AlwaysSuccessParkingApiService successService = new AlwaysSuccessParkingApiService(5);
+        @DisplayName("시나리오 1: 모든 요청이 실패해도 예외 없이 종료되고 저장은 발생하지 않는다")
+        void allFailuresAreGracefullyHandled() {
+            // given
             AlwaysFailParkingApiService failService = new AlwaysFailParkingApiService();
             ParkingUpdateScheduler scheduler = new ParkingUpdateScheduler(
-                    List.of(successService, failService),
+                    List.of(failService),
                     coordinateService,
                     parkingRepository,
                     executor
@@ -74,9 +84,8 @@ class ParkingUpdateSchedulerIntegrationTest {
             // when
             scheduler.autoUpdateOfferCurrentParking();
 
-            // then: 성공한 API의 데이터만 저장됨
-            assertThat(parkingRepository.count()).isEqualTo(5);
-            assertThat(successService.getCallCount()).isGreaterThan(0);
+            // then
+            assertThat(parkingRepository.count()).isZero();
             assertThat(failService.getCallCount()).isGreaterThan(0);
         }
 
@@ -99,16 +108,17 @@ class ParkingUpdateSchedulerIntegrationTest {
             // then
             assertThat(parkingRepository.count()).isEqualTo(expectedSize);
             assertThat(successService.getCallCount()).isGreaterThan(0);
+            assertStoredParkingNames(expectedParkingNames("success", expectedSize));
         }
 
         @Test
-        @DisplayName("시나리오 3: 일부 페이지 실패 시 성공한 페이지의 데이터만 저장된다")
-        void partialFailure() {
+        @DisplayName("시나리오 3: 초반 페이지 실패 후 후반 페이지가 성공하면 성공한 페이지 데이터만 저장된다")
+        void earlyFailureLateSuccess() {
             // given: 5페이지 중 2페이지 실패
             int totalPages = 5;
             int failingPages = 2;
-            PartialFailureParkingApiService service =
-                    new PartialFailureParkingApiService(totalPages, failingPages);
+            LeadingPageFailureParkingApiService service =
+                    new LeadingPageFailureParkingApiService(totalPages, failingPages);
             ParkingUpdateScheduler scheduler = new ParkingUpdateScheduler(
                     List.of(service),
                     coordinateService,
@@ -124,27 +134,55 @@ class ParkingUpdateSchedulerIntegrationTest {
             int expectedSize = totalPages - failingPages;
             assertThat(parkingRepository.count()).isEqualTo(expectedSize);
             assertThat(service.getCallCount()).isEqualTo(totalPages);
+            assertStoredParkingNames(Set.of("page3_parking_0", "page4_parking_0", "page5_parking_0"));
         }
 
         @Test
-        @DisplayName("시나리오 4: 모든 요청이 실패해도 예외 없이 빈 결과를 반환한다")
-        void allFailuresAreGracefullyHandled() {
-            // given
-            AlwaysFailParkingApiService failService = new AlwaysFailParkingApiService();
+        @DisplayName("시나리오 4: 초반 페이지 성공 후 후반 페이지가 실패해도 앞서 수집한 데이터는 저장된다")
+        void earlySuccessLateFailure() {
+            // given: 5페이지 중 뒤 2페이지 실패
+            int totalPages = 5;
+            int failingPagesFromEnd = 2;
+            TrailingPageFailureParkingApiService service =
+                    new TrailingPageFailureParkingApiService(totalPages, failingPagesFromEnd);
             ParkingUpdateScheduler scheduler = new ParkingUpdateScheduler(
-                    List.of(failService),
+                    List.of(service),
                     coordinateService,
                     parkingRepository,
                     executor
             );
 
-            // when & then: 예외 없이 정상 종료되어야 함
+            // when
             scheduler.autoUpdateOfferCurrentParking();
 
-            // 데이터가 저장되지 않음
-            assertThat(parkingRepository.count()).isZero();
-            // 요청은 시도됨
+            // then
+            int expectedSize = totalPages - failingPagesFromEnd;
+            assertThat(parkingRepository.count()).isEqualTo(expectedSize);
+            assertThat(service.getCallCount()).isEqualTo(totalPages);
+            assertStoredParkingNames(Set.of("page1_parking_0", "page2_parking_0", "page3_parking_0"));
+        }
+
+        @Test
+        @DisplayName("여러 API 중 일부만 성공해도 성공한 API의 데이터는 저장된다")
+        void mixedApiSuccess() {
+            // given: 하나는 성공, 하나는 실패
+            AlwaysSuccessParkingApiService successService = new AlwaysSuccessParkingApiService(5);
+            AlwaysFailParkingApiService failService = new AlwaysFailParkingApiService();
+            ParkingUpdateScheduler scheduler = new ParkingUpdateScheduler(
+                    List.of(successService, failService),
+                    coordinateService,
+                    parkingRepository,
+                    executor
+            );
+
+            // when
+            scheduler.autoUpdateOfferCurrentParking();
+
+            // then: 성공한 API의 데이터만 저장됨
+            assertThat(parkingRepository.count()).isEqualTo(5);
+            assertThat(successService.getCallCount()).isGreaterThan(0);
             assertThat(failService.getCallCount()).isGreaterThan(0);
+            assertStoredParkingNames(expectedParkingNames("success", 5));
         }
     }
 
@@ -272,12 +310,12 @@ class ParkingUpdateSchedulerIntegrationTest {
     /**
      * 일부 페이지만 실패하는 API 서비스
      */
-    static class PartialFailureParkingApiService implements ParkingApiService {
+    static class LeadingPageFailureParkingApiService implements ParkingApiService {
         private final int totalPages;
         private final int failingPages;  // 실패할 페이지 수 (앞에서부터)
         private final AtomicInteger callCount = new AtomicInteger(0);
 
-        PartialFailureParkingApiService(int totalPages, int failingPages) {
+        LeadingPageFailureParkingApiService(int totalPages, int failingPages) {
             this.totalPages = totalPages;
             this.failingPages = failingPages;
         }
@@ -295,7 +333,49 @@ class ParkingUpdateSchedulerIntegrationTest {
                 throw new RuntimeException("의도된 실패: 페이지 " + pageNumber);
             }
             // 나머지 페이지는 성공
-            return createParkingList(1, "partial_page" + pageNumber);
+            return createParkingList(1, "page" + pageNumber);
+        }
+
+        @Override
+        public int getReadSize() {
+            return 1;
+        }
+
+        @Override
+        public HealthCheckResponse check() {
+            return new HealthCheckResponse(true, totalPages);
+        }
+
+        public int getCallCount() {
+            return callCount.get();
+        }
+    }
+
+    /**
+     * 뒤쪽 페이지만 실패하는 API 서비스
+     */
+    static class TrailingPageFailureParkingApiService implements ParkingApiService {
+        private final int totalPages;
+        private final int failingPagesFromEnd;
+        private final AtomicInteger callCount = new AtomicInteger(0);
+
+        TrailingPageFailureParkingApiService(int totalPages, int failingPagesFromEnd) {
+            this.totalPages = totalPages;
+            this.failingPagesFromEnd = failingPagesFromEnd;
+        }
+
+        @Override
+        public boolean offerCurrentParking() {
+            return true;
+        }
+
+        @Override
+        public List<Parking> read(int pageNumber, int size) {
+            callCount.incrementAndGet();
+            if (pageNumber > totalPages - failingPagesFromEnd) {
+                throw new RuntimeException("의도된 실패: 페이지 " + pageNumber);
+            }
+            return createParkingList(1, "page" + pageNumber);
         }
 
         @Override
@@ -368,5 +448,19 @@ class ParkingUpdateSchedulerIntegrationTest {
             result.add(parking);
         }
         return result;
+    }
+
+    private Set<String> expectedParkingNames(String prefix, int count) {
+        return IntStream.range(0, count)
+                .mapToObj(i -> prefix + "_parking_" + i)
+                .collect(java.util.stream.Collectors.toSet());
+    }
+
+    private void assertStoredParkingNames(Set<String> expectedNames) {
+        Set<String> actualNames = parkingRepository.findAllByBaseInformationNameIn(expectedNames)
+                .stream()
+                .map(parking -> parking.getBaseInformation().getName())
+                .collect(java.util.stream.Collectors.toSet());
+        assertThat(actualNames).containsExactlyInAnyOrderElementsOf(expectedNames);
     }
 }
