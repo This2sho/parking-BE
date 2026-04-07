@@ -1,10 +1,12 @@
 package com.parkingcomestrue.external.api;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 
 import com.parkingcomestrue.fake.CircuitBreakerTestService2;
 import com.parkingcomestrue.fake.CircuitBreakerTestService3;
 import com.parkingcomestrue.fake.CircuitBreakerTestService4;
+import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -12,256 +14,214 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.DisplayName;
-import org.junit.jupiter.api.MethodOrderer;
-import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.TestMethodOrder;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.test.annotation.DirtiesContext;
 
-/**
- * CircuitBreaker AOP 전체 동작 테스트.
- *
- * 각 테스트는 서로 다른 서비스를 사용하거나,
- * 실행 순서를 명시적으로 지정하여 상태 의존성을 관리.
- *
- * 검증 항목:
- * 1. 에러율 20% 초과 시 서킷 열림 (요청 차단)
- * 2. 에러율 20% 미만 시 서킷 유지 (요청 허용)
- * 3. 최소 요청 횟수(10회) 미만 시 에러율 무시
- * 4. 서킷 열린 후 resetTime(200ms) 이후 자동으로 닫힘
- * 5. 서킷 열린 상태에서 요청 시 메서드 실행되지 않음
- */
 @SpringBootTest
-@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
+@DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_EACH_TEST_METHOD)
 class CircuitBreakerFullTest {
 
     @Autowired
-    private CircuitBreakerTestService2 serviceA;  // 서킷 열림 테스트용
+    private CircuitBreakerTestService2 serviceA;
 
     @Autowired
-    private CircuitBreakerTestService3 serviceB;  // 복구 테스트용
+    private CircuitBreakerTestService3 serviceB;
 
     @Autowired
-    private CircuitBreakerTestService4 serviceC;  // 경계값 테스트용
-
-    // ==================== serviceA를 사용하는 테스트 (순서대로 실행) ====================
+    private CircuitBreakerTestService4 serviceC;
 
     @Test
-    @Order(1)
-    @DisplayName("[serviceA] 에러율이 정확히 20%일 때 서킷이 열린다 (8성공 + 2실패)")
-    void test01_circuitOpensAtExactly20PercentErrorRate() {
-        // given: 8번 성공 + 2번 실패 = 20% 에러율
+    @DisplayName("실패 요청이 임계치에 도달하면 다음 요청부터 차단된다")
+    void opensCircuitWhenFailureRequestReachesThreshold() {
         for (int i = 0; i < 8; i++) {
             serviceA.call(() -> {});
         }
+
+        AtomicInteger failureExecutionCount = new AtomicInteger();
         for (int i = 0; i < 2; i++) {
-            callAndIgnoreException(serviceA);
+            serviceA.call(() -> failWithCount(failureExecutionCount));
         }
 
-        // when: 서킷이 열린 상태에서 호출
+        AtomicBoolean executedAfterOpen = new AtomicBoolean(false);
+        serviceA.call(() -> executedAfterOpen.set(true));
+
+        assertThat(failureExecutionCount.get()).isEqualTo(2);
+        assertThat(executedAfterOpen.get()).isFalse();
+    }
+
+    @Test
+    @DisplayName("최소 요청 수에 못 미치면 높은 실패율이어도 차단되지 않는다")
+    void staysClosedBelowMinimumRequestCount() {
+        AtomicInteger failureExecutionCount = new AtomicInteger();
+        for (int i = 0; i < 5; i++) {
+            serviceA.call(() -> failWithCount(failureExecutionCount));
+        }
+
         AtomicBoolean executed = new AtomicBoolean(false);
         serviceA.call(() -> executed.set(true));
 
-        // then: 실행되지 않음 (서킷 열림)
-        assertThat(executed.get())
-                .as("서킷이 열리면 메서드가 실행되지 않아야 함")
-                .isFalse();
+        assertThat(failureExecutionCount.get()).isEqualTo(5);
+        assertThat(executed.get()).isTrue();
     }
 
     @Test
-    @Order(2)
-    @DisplayName("[serviceA] 서킷 열린 상태에서 여러 번 호출해도 메서드가 실행되지 않는다")
-    void test02_methodNotExecutedWhenCircuitOpen() {
-        // given: Order(1) 테스트에서 서킷이 열린 상태
-
-        // when: 여러 번 호출
-        AtomicInteger executionCount = new AtomicInteger(0);
-        for (int i = 0; i < 5; i++) {
-            serviceA.call(() -> executionCount.incrementAndGet());
-        }
-
-        // then: 한 번도 실행되지 않음
-        assertThat(executionCount.get())
-                .as("서킷이 열린 상태에서는 메서드가 실행되지 않아야 함")
-                .isZero();
-    }
-
-    @Test
-    @Order(3)
-    @DisplayName("[serviceA] 서킷 열린 상태에서 예외를 던지는 람다도 실행되지 않는다")
-    void test03_noExceptionWhenCircuitOpen() {
-        // given: Order(1) 테스트에서 서킷이 열린 상태
-
-        // when & then: 예외 없이 정상 종료 (람다가 실행되지 않으므로)
-        serviceA.call(() -> {
-            throw new RuntimeException("이 예외는 발생하면 안 됨");
-        });
-        // 테스트가 여기까지 도달하면 성공
-    }
-
-    // ==================== serviceB를 사용하는 테스트 (복구 테스트) ====================
-
-    @Test
-    @Order(10)
-    @DisplayName("[serviceB] 서킷 열린 후 resetTime(200ms) 이후 자동으로 닫힌다")
-    void test10_circuitClosesAfterResetTime() throws InterruptedException {
-        // given: 서킷 열기
+    @DisplayName("차단 직전까지는 요청이 실행되고 차단 이후 요청만 막힌다")
+    void allowsRequestBeforeOpeningAndBlocksNextRequest() {
+        AtomicInteger failureExecutionCount = new AtomicInteger();
         for (int i = 0; i < 8; i++) {
-            serviceB.call(() -> {});
-        }
-        for (int i = 0; i < 2; i++) {
-            callAndIgnoreException(serviceB);
+            serviceA.call(() -> failWithCount(failureExecutionCount));
         }
 
-        // 서킷이 열렸는지 확인
-        AtomicBoolean beforeReset = new AtomicBoolean(false);
-        serviceB.call(() -> beforeReset.set(true));
-        assertThat(beforeReset.get())
-                .as("서킷이 열린 직후에는 메서드가 실행되지 않아야 함")
-                .isFalse();
+        AtomicBoolean tenthRequestExecuted = new AtomicBoolean(false);
+        serviceA.call(() -> tenthRequestExecuted.set(true));
 
-        // when: resetTime 대기 (200ms + 여유)
-        Thread.sleep(500);
+        AtomicBoolean eleventhFailureExecuted = new AtomicBoolean(false);
+        serviceA.call(() -> {
+            eleventhFailureExecuted.set(true);
+            throw new RuntimeException("threshold crossing failure");
+        });
 
-        // then: 서킷 닫혀서 실행됨
-        AtomicBoolean afterReset = new AtomicBoolean(false);
-        serviceB.call(() -> afterReset.set(true));
-        assertThat(afterReset.get())
-                .as("resetTime 이후에는 서킷이 닫혀서 메서드가 실행되어야 함")
-                .isTrue();
+        AtomicBoolean blockedAfterOpen = new AtomicBoolean(false);
+        serviceA.call(() -> blockedAfterOpen.set(true));
+
+        assertThat(tenthRequestExecuted.get()).isTrue();
+        assertThat(eleventhFailureExecuted.get()).isTrue();
+        assertThat(blockedAfterOpen.get()).isFalse();
     }
 
     @Test
-    @Order(11)
-    @DisplayName("[serviceB] 서킷 복구 후 카운터가 리셋되어 새로운 에러 카운트 시작")
-    void test11_counterResetsAfterRecovery() {
-        // given: Order(10) 테스트에서 서킷이 복구됨
-        // 복구 후 새로운 요청들 (10% 에러율)
+    @DisplayName("열린 서킷은 reset time 이후 다시 닫히고 요청을 허용한다")
+    void closesAfterResetTime() {
+        openCircuit(serviceB);
+
+        AtomicBoolean blockedWhileOpen = new AtomicBoolean(false);
+        serviceB.call(() -> blockedWhileOpen.set(true));
+        assertThat(blockedWhileOpen.get()).isFalse();
+
+        AtomicBoolean executedAfterReset = new AtomicBoolean(false);
+        await()
+                .atMost(Duration.ofSeconds(2))
+                .pollInterval(Duration.ofMillis(25))
+                .untilAsserted(() -> {
+                    executedAfterReset.set(false);
+                    serviceB.call(() -> executedAfterReset.set(true));
+                    assertThat(executedAfterReset.get()).isTrue();
+                });
+    }
+
+    @Test
+    @DisplayName("reset 이후에는 이전 실패율이 아닌 새 카운터로 다시 계산한다")
+    void resetsCountersAfterRecovery() {
+        openCircuit(serviceB);
+
+        await()
+                .atMost(Duration.ofSeconds(2))
+                .pollInterval(Duration.ofMillis(25))
+                .untilAsserted(() -> {
+                    AtomicBoolean probe = new AtomicBoolean(false);
+                    serviceB.call(() -> probe.set(true));
+                    assertThat(probe.get()).isTrue();
+                });
+
         for (int i = 0; i < 9; i++) {
             serviceB.call(() -> {});
         }
-        callAndIgnoreException(serviceB);
+        serviceB.call(() -> {
+            throw new RuntimeException("single failure after reset");
+        });
 
-        // when
         AtomicBoolean executed = new AtomicBoolean(false);
         serviceB.call(() -> executed.set(true));
 
-        // then: 10% < 20% 이므로 서킷 닫힘
-        assertThat(executed.get())
-                .as("에러율이 20% 미만이면 서킷이 열리지 않아야 함")
-                .isTrue();
-    }
-
-    // ==================== serviceC를 사용하는 테스트 (경계값 테스트) ====================
-
-    @Test
-    @Order(20)
-    @DisplayName("[serviceC] 최소 요청 횟수(10회) 미만이면 100% 에러율이어도 서킷 열리지 않음")
-    void test20_circuitStaysClosedBelowMinimumCount() {
-        // given: 5번 모두 실패 (100% 에러율, but 최소 횟수 미달)
-        for (int i = 0; i < 5; i++) {
-            callAndIgnoreException(serviceC);
-        }
-
-        // when
-        AtomicBoolean executed = new AtomicBoolean(false);
-        serviceC.call(() -> executed.set(true));
-
-        // then: 최소 횟수 미달로 서킷 열리지 않음
-        assertThat(executed.get())
-                .as("최소 요청 횟수 미달이면 에러율과 무관하게 서킷이 열리지 않아야 함")
-                .isTrue();
+        assertThat(executed.get()).isTrue();
     }
 
     @Test
-    @Order(21)
-    @DisplayName("[serviceC] 정확히 10번째 요청에서 에러율 계산이 시작된다")
-    void test21_errorRateCalculationStartsAtTenthRequest() {
-        // given: Order(20)에서 5번 실패 + 1번 성공 = 6번 호출됨
-        // 3번 더 실패하면 9번 → 아직 최소 횟수 미달
-        for (int i = 0; i < 3; i++) {
-            callAndIgnoreException(serviceC);
-        }
+    @DisplayName("한 서비스의 서킷이 열려도 다른 서비스 요청은 영향을 받지 않는다")
+    void isolatesCircuitStatePerTargetBean() {
+        openCircuit(serviceA);
 
-        // 9번째까지는 서킷 열리지 않음 (최소 10회 미달)
-        AtomicBoolean beforeTenth = new AtomicBoolean(false);
-        serviceC.call(() -> beforeTenth.set(true));
-        assertThat(beforeTenth.get())
-                .as("9회까지는 최소 횟수 미달로 서킷이 열리지 않아야 함")
-                .isTrue();
+        AtomicBoolean blockedOnServiceA = new AtomicBoolean(false);
+        serviceA.call(() -> blockedOnServiceA.set(true));
 
-        // when: 10번째 실패 (이제 최소 횟수 충족)
-        // 현재 상태: 8실패 + 2성공 = 80% 에러율
-        callAndIgnoreException(serviceC);
+        AtomicBoolean executedOnServiceB = new AtomicBoolean(false);
+        serviceB.call(() -> executedOnServiceB.set(true));
 
-        // then: 서킷 열림
-        AtomicBoolean afterTenth = new AtomicBoolean(false);
-        serviceC.call(() -> afterTenth.set(true));
-        assertThat(afterTenth.get())
-                .as("10회 이후 에러율이 20% 이상이면 서킷이 열려야 함")
-                .isFalse();
+        assertThat(blockedOnServiceA.get()).isFalse();
+        assertThat(executedOnServiceB.get()).isTrue();
     }
 
-    // ==================== 동시성 테스트 (독립적) ====================
-
     @Test
-    @Order(30)
-    @DisplayName("[독립] 동시에 여러 스레드에서 요청해도 에러율이 정확하게 계산된다")
-    void test30_accurateErrorRateWithConcurrentRequests() throws InterruptedException {
-        // serviceA의 리셋을 기다림
-        Thread.sleep(500);
+    @DisplayName("동시 요청에서도 임계 실패율에 도달하면 이후 요청은 차단된다")
+    void opensCircuitAfterConcurrentRequestsReachThreshold() throws InterruptedException {
+        int totalRequests = 10;
+        int successRequests = 8;
+        ExecutorService executor = Executors.newFixedThreadPool(totalRequests);
+        CountDownLatch ready = new CountDownLatch(totalRequests);
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch done = new CountDownLatch(totalRequests);
+        AtomicInteger executedSuccessCount = new AtomicInteger();
+        AtomicInteger executedFailureCount = new AtomicInteger();
 
-        // given
-        int threadCount = 100;
-        int successCount = 79;  // 79% 성공, 21% 실패 → 서킷 열림
-        ExecutorService executor = Executors.newFixedThreadPool(20);
-        CountDownLatch latch = new CountDownLatch(threadCount);
-
-        // when: 동시에 100개 요청 (79 성공, 21 실패)
-        for (int i = 0; i < threadCount; i++) {
-            final int index = i;
+        for (int i = 0; i < totalRequests; i++) {
+            final boolean shouldFail = i >= successRequests;
             executor.submit(() -> {
+                ready.countDown();
                 try {
-                    if (index < successCount) {
-                        serviceA.call(() -> {});
+                    start.await(5, TimeUnit.SECONDS);
+                    if (shouldFail) {
+                        serviceC.call(() -> failWithCount(executedFailureCount));
                     } else {
-                        callAndIgnoreException(serviceA);
+                        serviceC.call(executedSuccessCount::incrementAndGet);
                     }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
                 } finally {
-                    latch.countDown();
+                    done.countDown();
                 }
             });
         }
 
-        latch.await(10, TimeUnit.SECONDS);
+        assertThat(ready.await(5, TimeUnit.SECONDS)).isTrue();
+        start.countDown();
+        assertThat(done.await(5, TimeUnit.SECONDS)).isTrue();
         executor.shutdown();
+        assertThat(executor.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
 
-        // then: 에러율 21%로 서킷 열림
-        AtomicBoolean executed = new AtomicBoolean(false);
-        serviceA.call(() -> executed.set(true));
-        assertThat(executed.get())
-                .as("동시 요청에서도 에러율 21%이면 서킷이 열려야 함")
-                .isFalse();
+        AtomicBoolean blockedAfterConcurrentCalls = new AtomicBoolean(false);
+        serviceC.call(() -> blockedAfterConcurrentCalls.set(true));
+
+        assertThat(executedSuccessCount.get()).isEqualTo(successRequests);
+        assertThat(executedFailureCount.get()).isEqualTo(totalRequests - successRequests);
+        assertThat(blockedAfterConcurrentCalls.get()).isFalse();
     }
 
-    // ===== Helper 메서드 =====
-
-    private void callAndIgnoreException(CircuitBreakerTestService2 service) {
-        try {
-            service.call(() -> { throw new RuntimeException("의도된 실패"); });
-        } catch (Exception ignored) {}
+    private void openCircuit(CircuitBreakerTestService2 service) {
+        for (int i = 0; i < 8; i++) {
+            service.call(() -> {});
+        }
+        for (int i = 0; i < 2; i++) {
+            service.call(() -> {
+                throw new RuntimeException("open circuit");
+            });
+        }
     }
 
-    private void callAndIgnoreException(CircuitBreakerTestService3 service) {
-        try {
-            service.call(() -> { throw new RuntimeException("의도된 실패"); });
-        } catch (Exception ignored) {}
+    private void openCircuit(CircuitBreakerTestService3 service) {
+        for (int i = 0; i < 8; i++) {
+            service.call(() -> {});
+        }
+        for (int i = 0; i < 2; i++) {
+            service.call(() -> {
+                throw new RuntimeException("open circuit");
+            });
+        }
     }
 
-    private void callAndIgnoreException(CircuitBreakerTestService4 service) {
-        try {
-            service.call(() -> { throw new RuntimeException("의도된 실패"); });
-        } catch (Exception ignored) {}
+    private void failWithCount(AtomicInteger counter) {
+        counter.incrementAndGet();
+        throw new RuntimeException("intentional failure");
     }
 }

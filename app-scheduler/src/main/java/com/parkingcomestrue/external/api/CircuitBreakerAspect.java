@@ -27,10 +27,10 @@ public class CircuitBreakerAspect {
         }
         try {
             Object result = proceedingJoinPoint.proceed();
-            apiCounter.totalCountUp();
+            recordSuccess(annotation, apiCounter);
             return result;
         } catch (Throwable e) {
-            handleError(annotation, apiCounter);
+            recordFailure(annotation, apiCounter);
             return null;
         }
     }
@@ -40,10 +40,14 @@ public class CircuitBreakerAspect {
         return map.computeIfAbsent(target, key -> new ApiCounter(minTotalCount));
     }
 
-    private void handleError(CircuitBreaker annotation, ApiCounter apiCounter) {
-        apiCounter.errorCountUp();
-        if (apiCounter.isErrorRateOverThan(annotation.errorRate())) {
-            apiCounter.open();
+    private void recordSuccess(CircuitBreaker annotation, ApiCounter apiCounter) {
+        if (apiCounter.recordSuccess(annotation.errorRate())) {
+            scheduler.schedule(apiCounter::reset, annotation.resetTime(), annotation.timeUnit());
+        }
+    }
+
+    private void recordFailure(CircuitBreaker annotation, ApiCounter apiCounter) {
+        if (apiCounter.recordFailure(annotation.errorRate())) {
             scheduler.schedule(apiCounter::reset, annotation.resetTime(), annotation.timeUnit());
         }
     }
